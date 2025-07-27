@@ -57,8 +57,11 @@ module conv1_layer_opt (
     // Circular Line Buffer (5 lines of 28 pixels)
     reg [7:0] line_buffer [0:KERNEL_SIZE-1][0:WIDTH-1];
     reg [4:0] line_buf_w_col_idx; // Column write index
+    // p_line_to_win_col
     reg [2:0] line_buf_w_ptr;     // Row write pointer (for circular behavior)
+    // p_line_row_wt
     reg [2:0] line_buf_r_ptr;     // Row read pointer (maps logical top row to physical index)
+    // (p_line_row_wt + 1)%5  or 
 
     // Window Buffer (5x5 sliding window)
     reg [7:0] window_buffer [0:KERNEL_SIZE-1][0:KERNEL_SIZE-1];
@@ -98,7 +101,7 @@ module conv1_layer_opt (
             // Use conv_cycle-1 because MAC cycles are 1-5, corresponding to columns 0-4
             wire [4:0] mac_col_idx = conv_cycle - 1;
 
-            wire signed [8:0] data_ext = {window_buffer[physical_row_idx][mac_col_idx][7], window_buffer[physical_row_idx][mac_col_idx]};
+            wire signed [8:0] data_ext = {1'b0, window_buffer[physical_row_idx][mac_col_idx]};
 
             assign mac_out_ch0[i] = data_ext * weights_ch0[mac_col_idx*5 + i];
             assign mac_out_ch1[i] = data_ext * weights_ch1[mac_col_idx*5 + i];
