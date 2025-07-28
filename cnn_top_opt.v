@@ -28,6 +28,9 @@ module cnn_top_opt (
     // Busy signals
     wire conv1_busy, max1_busy, conv2_busy, max2_busy, fc_busy;
     
+    // Ready signals
+    wire conv1_ready, max1_ready, conv2_ready, max2_ready, fc_ready;
+    
     // Overall busy signal
     assign busy = conv1_busy | max1_busy | conv2_busy | max2_busy | fc_busy;
     
@@ -41,7 +44,8 @@ module cnn_top_opt (
         .conv_out_2(conv1_out_2),
         .conv_out_3(conv1_out_3),
         .valid_out(conv1_valid),
-        .busy(conv1_busy)
+        .busy(conv1_busy),
+        .ready(conv1_ready)
     );
     
     // MaxPool1 + ReLU
@@ -61,7 +65,8 @@ module cnn_top_opt (
         .max_value_2(max1_out_2),
         .max_value_3(max1_out_3),
         .valid_out(max1_valid),
-        .busy(max1_busy)
+        .busy(max1_busy),
+        .ready(max1_ready)
     );
     
     // Conv2 Layer
@@ -76,7 +81,8 @@ module cnn_top_opt (
         .conv2_out_2(conv2_out_2),
         .conv2_out_3(conv2_out_3),
         .valid_out(conv2_valid),
-        .busy(conv2_busy)
+        .busy(conv2_busy),
+        .ready(conv2_ready)
     );
     
     // MaxPool2 + ReLU
@@ -96,7 +102,8 @@ module cnn_top_opt (
         .max_value_2(max2_out_2),
         .max_value_3(max2_out_3),
         .valid_out(max2_valid),
-        .busy(max2_busy)
+        .busy(max2_busy),
+        .ready(max2_ready)
     );
     
     // Fully Connected Layer
@@ -114,7 +121,8 @@ module cnn_top_opt (
         .data_in_3(max2_out_3),
         .data_out(fc_out),
         .valid_out(fc_valid),
-        .busy(fc_busy)
+        .busy(fc_busy),
+        .ready(fc_ready)
     );
     
     // Streaming Comparator

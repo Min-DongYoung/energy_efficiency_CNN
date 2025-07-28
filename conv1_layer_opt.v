@@ -5,8 +5,7 @@ module conv1_layer_opt (
     input valid_in,
     output reg [11:0] conv_out_1, conv_out_2, conv_out_3,
     output reg valid_out,
-    output reg busy,
-    output reg ready  // Handshake signal
+    output reg busy
 );
     // Parameters
     localparam WIDTH = 28;
