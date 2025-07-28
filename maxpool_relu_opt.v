@@ -1,8 +1,3 @@
-/*------------------------------------------------------------------------
- *  File name  : maxpool_relu_opt.v
- *  Design     : Fixed MaxPooling + ReLU with proper 2x2 window handling
- *------------------------------------------------------------------------*/
-
 module maxpool_relu_opt #(
     parameter CONV_BIT = 12,
     parameter INPUT_WIDTH = 24,
@@ -14,13 +9,14 @@ module maxpool_relu_opt #(
     input signed [CONV_BIT-1:0] conv_out_1, conv_out_2, conv_out_3,
     output reg [CONV_BIT-1:0] max_value_1, max_value_2, max_value_3,
     output reg valid_out,
-    output reg busy
+    output reg busy,
+    output reg ready
 );
 
     // Clock gating
     wire gclk;
     wire clk_en;
-    assign clk_en = valid_in | busy | (state != IDLE);
+    assign clk_en = valid_in | busy | valid_out;
     
     clock_gate cg (
         .clk(clk),
@@ -29,125 +25,125 @@ module maxpool_relu_opt #(
     );
     
     // States
-    localparam IDLE = 2'b00;
-    localparam COLLECT = 2'b01;
-    localparam PROCESS = 2'b10;
+    localparam IDLE = 1'b0;
+    localparam PROCESS = 1'b1;
     
-    reg [1:0] state;
+    reg state;
     
-    // Line buffer for one row
-    reg signed [CONV_BIT-1:0] row_buffer_1 [0:INPUT_WIDTH-1];
-    reg signed [CONV_BIT-1:0] row_buffer_2 [0:INPUT_WIDTH-1];
-    reg signed [CONV_BIT-1:0] row_buffer_3 [0:INPUT_WIDTH-1];
+    // Pool buffers - one row of output width for each channel
+    reg signed [CONV_BIT-1:0] pool_buf_1 [0:OUTPUT_WIDTH-1];
+    reg signed [CONV_BIT-1:0] pool_buf_2 [0:OUTPUT_WIDTH-1];
+    reg signed [CONV_BIT-1:0] pool_buf_3 [0:OUTPUT_WIDTH-1];
     
     // Position tracking
-    reg [4:0] x_in, y_in;   // Input position (0-23)
-    reg [3:0] x_out, y_out; // Output position (0-11)
-    reg row_complete;
+    reg [4:0] x_in;    // Input column (0-23)
+    reg [4:0] y_in;    // Input row (0-23)
     
-    // 2x2 window values
-    wire signed [CONV_BIT-1:0] val_00_1, val_01_1, val_10_1, val_11_1;
-    wire signed [CONV_BIT-1:0] val_00_2, val_01_2, val_10_2, val_11_2;
-    wire signed [CONV_BIT-1:0] val_00_3, val_01_3, val_10_3, val_11_3;
+    // Control signals
+    wire is_odd_row = y_in[0];
+    wire is_odd_col = x_in[0];
+    wire output_enable = is_odd_row & is_odd_col;
+    wire [3:0] buf_idx = x_in >> 1;  // x_in / 2
     
-    // Current and buffered values
-    assign val_11_1 = conv_out_1;  // Current input
-    assign val_11_2 = conv_out_2;
-    assign val_11_3 = conv_out_3;
+    // Max comparison results
+    wire signed [CONV_BIT-1:0] max_cmp_1, max_cmp_2, max_cmp_3;
     
-    assign val_10_1 = row_buffer_1[x_in-1];  // Left of current
-    assign val_10_2 = row_buffer_2[x_in-1];
-    assign val_10_3 = row_buffer_3[x_in-1];
+    // Compare with zero for implicit ReLU
+    wire signed [CONV_BIT-1:0] relu_in_1 = (conv_out_1 > 0) ? conv_out_1 : 0;
+    wire signed [CONV_BIT-1:0] relu_in_2 = (conv_out_2 > 0) ? conv_out_2 : 0;
+    wire signed [CONV_BIT-1:0] relu_in_3 = (conv_out_3 > 0) ? conv_out_3 : 0;
     
-    assign val_01_1 = row_buffer_1[x_in];    // Above current
-    assign val_01_2 = row_buffer_2[x_in];
-    assign val_01_3 = row_buffer_3[x_in];
+    // Max comparison
+    assign max_cmp_1 = (relu_in_1 > pool_buf_1[buf_idx]) ? relu_in_1 : pool_buf_1[buf_idx];
+    assign max_cmp_2 = (relu_in_2 > pool_buf_2[buf_idx]) ? relu_in_2 : pool_buf_2[buf_idx];
+    assign max_cmp_3 = (relu_in_3 > pool_buf_3[buf_idx]) ? relu_in_3 : pool_buf_3[buf_idx];
     
-    assign val_00_1 = row_buffer_1[x_in-1];  // Diagonal
-    assign val_00_2 = row_buffer_2[x_in-1];
-    assign val_00_3 = row_buffer_3[x_in-1];
-    
-    // Max and ReLU logic
-    wire signed [CONV_BIT-1:0] max_1, max_2, max_3;
-    
-    assign max_1 = (val_00_1 > val_01_1) ? 
-                   ((val_00_1 > val_10_1) ? 
-                    ((val_00_1 > val_11_1) ? val_00_1 : val_11_1) :
-                    ((val_10_1 > val_11_1) ? val_10_1 : val_11_1)) :
-                   ((val_01_1 > val_10_1) ? 
-                    ((val_01_1 > val_11_1) ? val_01_1 : val_11_1) :
-                    ((val_10_1 > val_11_1) ? val_10_1 : val_11_1));
-    
-    assign max_2 = (val_00_2 > val_01_2) ? 
-                   ((val_00_2 > val_10_2) ? 
-                    ((val_00_2 > val_11_2) ? val_00_2 : val_11_2) :
-                    ((val_10_2 > val_11_2) ? val_10_2 : val_11_2)) :
-                   ((val_01_2 > val_10_2) ? 
-                    ((val_01_2 > val_11_2) ? val_01_2 : val_11_2) :
-                    ((val_10_2 > val_11_2) ? val_10_2 : val_11_2));
-    
-    assign max_3 = (val_00_3 > val_01_3) ? 
-                   ((val_00_3 > val_10_3) ? 
-                    ((val_00_3 > val_11_3) ? val_00_3 : val_11_3) :
-                    ((val_10_3 > val_11_3) ? val_10_3 : val_11_3)) :
-                   ((val_01_3 > val_10_3) ? 
-                    ((val_01_3 > val_11_3) ? val_01_3 : val_11_3) :
-                    ((val_10_3 > val_11_3) ? val_10_3 : val_11_3));
+    // Initialize buffers
+    integer i;
     
     always @(posedge gclk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE;
             x_in <= 0;
             y_in <= 0;
-            x_out <= 0;
-            y_out <= 0;
             valid_out <= 0;
             busy <= 0;
-            row_complete <= 0;
+            ready <= 1;
+            
+            // Initialize pool buffers to 0
+            for (i = 0; i < OUTPUT_WIDTH; i = i + 1) begin
+                pool_buf_1[i] <= 0;
+                pool_buf_2[i] <= 0;
+                pool_buf_3[i] <= 0;
+            end
         end else begin
             valid_out <= 0;
+            ready <= 1;  // Always ready to accept input
             
             case (state)
                 IDLE: begin
                     if (valid_in) begin
-                        state <= COLLECT;
+                        state <= PROCESS;
                         busy <= 1;
-                        x_in <= 0;
+                        
+                        // Process first input
+                        pool_buf_1[0] <= relu_in_1;
+                        pool_buf_2[0] <= relu_in_2;
+                        pool_buf_3[0] <= relu_in_3;
+                        
+                        x_in <= 1;
                         y_in <= 0;
                     end
                 end
                 
-                COLLECT: begin
+                PROCESS: begin
                     if (valid_in) begin
-                        // Store current value in row buffer
-                        row_buffer_1[x_in] <= conv_out_1;
-                        row_buffer_2[x_in] <= conv_out_2;
-                        row_buffer_3[x_in] <= conv_out_3;
-                        
-                        // Check if we can output (odd x and odd y)
-                        if (x_in[0] && y_in[0]) begin
-                            max_value_1 <= (max_1 > 0) ? max_1 : 0;
-                            max_value_2 <= (max_2 > 0) ? max_2 : 0;
-                            max_value_3 <= (max_3 > 0) ? max_3 : 0;
+                        // Update pool buffers with max value
+                        if (output_enable) begin
+                            // Output current max and reset buffer
+                            max_value_1 <= max_cmp_1;
+                            max_value_2 <= max_cmp_2;
+                            max_value_3 <= max_cmp_3;
                             valid_out <= 1;
                             
-                            x_out <= x_out + 1;
-                            if (x_out == OUTPUT_WIDTH - 1) begin
-                                x_out <= 0;
-                                y_out <= y_out + 1;
-                            end
+                            // Reset buffer for next window
+                            pool_buf_1[buf_idx] <= 0;
+                            pool_buf_2[buf_idx] <= 0;
+                            pool_buf_3[buf_idx] <= 0;
+                        end else begin
+                            // Update buffer with max value
+                            pool_buf_1[buf_idx] <= max_cmp_1;
+                            pool_buf_2[buf_idx] <= max_cmp_2;
+                            pool_buf_3[buf_idx] <= max_cmp_3;
                         end
                         
-                        // Update position
+                        // Position update
                         if (x_in == INPUT_WIDTH - 1) begin
                             x_in <= 0;
+                            
                             if (y_in == INPUT_WIDTH - 1) begin
-                                // Done
+                                // Frame complete
                                 state <= IDLE;
                                 busy <= 0;
                                 y_in <= 0;
+                                
+                                // Reset all buffers
+                                for (i = 0; i < OUTPUT_WIDTH; i = i + 1) begin
+                                    pool_buf_1[i] <= 0;
+                                    pool_buf_2[i] <= 0;
+                                    pool_buf_3[i] <= 0;
+                                end
                             end else begin
                                 y_in <= y_in + 1;
+                                
+                                // Reset buffers at even rows (start of new output row)
+                                if (!y_in[0]) begin  // Current row is odd, next will be even
+                                    for (i = 0; i < OUTPUT_WIDTH; i = i + 1) begin
+                                        pool_buf_1[i] <= 0;
+                                        pool_buf_2[i] <= 0;
+                                        pool_buf_3[i] <= 0;
+                                    end
+                                end
                             end
                         end else begin
                             x_in <= x_in + 1;

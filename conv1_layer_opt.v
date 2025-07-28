@@ -1,22 +1,3 @@
-/*------------------------------------------------------------------------
- *
- *  File name  : conv1_layer_opt.v
- *  Design     : Optimized 1st Conv Layer (v3.0)
- *  Author     : Gemini
- *  Description:
- *    - Renamed kernel_buffer to window_buffer for clarity.
- *    - Separated compute (5 cycles) and output/shift (1 cycle) stages
- *      for timing optimization. Bias addition is overlapped with shifting.
- *    - Implemented a circular line buffer with a write pointer (line_buf_w_ptr)
- *      to eliminate large, inefficient data shifts.
- *    - Data is transferred from line_buffer to window_buffer as-is, without
- *      reordering, to minimize routing complexity.
- *    - A read pointer (line_buf_r_ptr) is used to calculate the physical
- *      address of the logical top row within the window_buffer, ensuring
- *      correct MAC operation regardless of the circular buffer's state.
- *
- *------------------------------------------------------------------------*/
-
 module conv1_layer_opt (
     input clk,
     input rst_n,
@@ -24,91 +5,109 @@ module conv1_layer_opt (
     input valid_in,
     output reg [11:0] conv_out_1, conv_out_2, conv_out_3,
     output reg valid_out,
-    output reg busy
+    output reg busy,
+    output reg ready  // Handshake signal
 );
-
     // Parameters
     localparam WIDTH = 28;
     localparam HEIGHT = 28;
     localparam KERNEL_SIZE = 5;
-    localparam OUT_WIDTH = WIDTH - KERNEL_SIZE + 1;
-    localparam OUT_HEIGHT = HEIGHT - KERNEL_SIZE + 1;
-
+    localparam CHANNELS_OUT = 3;
+    
     // Clock gating
     wire gclk;
     wire clk_en;
-    assign clk_en = valid_in | busy;
-
+    assign clk_en = valid_in | busy | (state != IDLE);
+    
     clock_gate cg (
         .clk(clk),
         .enable(clk_en),
         .gclk(gclk)
     );
-
+    
     // States
     localparam IDLE = 2'b00;
     localparam FILL = 2'b01;
     localparam COMPUTE = 2'b10;
-
+    
     reg [1:0] state;
-
-    // -- Optimized Buffer & Pointer Structures --
-
-    // Circular Line Buffer (5 lines of 28 pixels)
+    
+    // Circular Line Buffer - 5 lines of 28 pixels
     reg [7:0] line_buffer [0:KERNEL_SIZE-1][0:WIDTH-1];
-    reg [4:0] line_buf_w_col_idx; // Column write index
-    // p_line_to_win_col
-    reg [2:0] line_buf_w_ptr;     // Row write pointer (for circular behavior)
-    // p_line_row_wt
-    reg [2:0] line_buf_r_ptr;     // Row read pointer (maps logical top row to physical index)
-    // (p_line_row_wt + 1)%5  or 
-
-    // Window Buffer (5x5 sliding window)
+    
+    // Window Buffer - 5x5 sliding window
     reg [7:0] window_buffer [0:KERNEL_SIZE-1][0:KERNEL_SIZE-1];
-
-    // Position & Cycle Tracking
-    reg [4:0] x_pos, y_pos;
-    reg [2:0] conv_cycle;  // 0: prep, 1-5: mac, 6: output/shift
-
-    // Weight & Bias Storage
-    reg signed [7:0] weights_ch0 [0:24];
-    reg signed [7:0] weights_ch1 [0:24];
-    reg signed [7:0] weights_ch2 [0:24];
+    
+    // Position tracking
+    reg [4:0] x_pos, y_pos;   // Current position (0-27)
+    reg [2:0] conv_cycle;     // 0-4 for MAC cycles
+    
+    // Pointers
+    wire [2:0] p_row_line;              // Line buffer write pointer
+    wire [4:0] p_col_line_to_win;       // Column pointer for window buffer update
+    
+    assign p_row_line = y_pos % KERNEL_SIZE;
+    assign p_col_line_to_win = (x_pos + KERNEL_SIZE) % WIDTH;
+    
+    // Weight storage (3 output channels)
+    reg signed [7:0] weights_ch0 [0:KERNEL_SIZE-1][0:KERNEL_SIZE-1];
+    reg signed [7:0] weights_ch1 [0:KERNEL_SIZE-1][0:KERNEL_SIZE-1];
+    reg signed [7:0] weights_ch2 [0:KERNEL_SIZE-1][0:KERNEL_SIZE-1];
     reg signed [7:0] bias [0:2];
-
-    // MAC Accumulators
-    reg signed [19:0] acc_ch0, acc_ch1, acc_ch2;
-
-    // Load weights from memory files
+    
+    // Load weights (flatten for initialization)
+    reg signed [7:0] weights_ch0_flat [0:24];
+    reg signed [7:0] weights_ch1_flat [0:24];
+    reg signed [7:0] weights_ch2_flat [0:24];
+    
     initial begin
-        $readmemh("conv1_weight_1.txt", weights_ch0);
-        $readmemh("conv1_weight_2.txt", weights_ch1);
-        $readmemh("conv1_weight_3.txt", weights_ch2);
+        $readmemh("conv1_weight_1.txt", weights_ch0_flat);
+        $readmemh("conv1_weight_2.txt", weights_ch1_flat);
+        $readmemh("conv1_weight_3.txt", weights_ch2_flat);
         $readmemh("conv1_bias.txt", bias);
+        
+        // Convert to 2D arrays
+        for (integer i = 0; i < 25; i = i + 1) begin
+            weights_ch0[i/5][i%5] <= weights_ch0_flat[i];
+            weights_ch1[i/5][i%5] <= weights_ch1_flat[i];
+            weights_ch2[i/5][i%5] <= weights_ch2_flat[i];
+        end
     end
-
-    // -- Parallel MAC Units with Smart Indexing --
-    wire signed [15:0] mac_out_ch0 [0:4];
-    wire signed [15:0] mac_out_ch1 [0:4];
-    wire signed [15:0] mac_out_ch2 [0:4];
-
-    genvar i;
+    
+    // MAC accumulators
+    reg signed [19:0] acc_ch0, acc_ch1, acc_ch2;
+    
+    // MUX for logical row selection
+    wire [7:0] mac_input [0:KERNEL_SIZE-1];
+    genvar k;
     generate
-        for (i = 0; i < KERNEL_SIZE; i = i + 1) begin : mac_gen
-            // Calculate the physical row index in the window_buffer that corresponds to the logical row 'i'
-            wire [2:0] physical_row_idx = (line_buf_r_ptr + i) % KERNEL_SIZE;
-            
-            // Use conv_cycle-1 because MAC cycles are 1-5, corresponding to columns 0-4
-            wire [4:0] mac_col_idx = conv_cycle - 1;
-
-            wire signed [8:0] data_ext = {1'b0, window_buffer[physical_row_idx][mac_col_idx]};
-
-            assign mac_out_ch0[i] = data_ext * weights_ch0[mac_col_idx*5 + i];
-            assign mac_out_ch1[i] = data_ext * weights_ch1[mac_col_idx*5 + i];
-            assign mac_out_ch2[i] = data_ext * weights_ch2[mac_col_idx*5 + i];
+        for (k = 0; k < KERNEL_SIZE; k = k + 1) begin : row_mux
+            assign mac_input[k] = window_buffer[(k + p_row_line + 1) % KERNEL_SIZE][conv_cycle];
         end
     endgenerate
-
+    
+    // MAC outputs - registered for pipeline
+    reg signed [15:0] mac_out_ch0 [0:KERNEL_SIZE-1];
+    reg signed [15:0] mac_out_ch1 [0:KERNEL_SIZE-1];
+    reg signed [15:0] mac_out_ch2 [0:KERNEL_SIZE-1];
+    
+    // Compute MACs
+    integer i;
+    always @(posedge gclk) begin
+        for (i = 0; i < KERNEL_SIZE; i = i + 1) begin
+            mac_out_ch0[i] <= $signed({1'b0, mac_input[i]}) * weights_ch0[i][conv_cycle];
+            mac_out_ch1[i] <= $signed({1'b0, mac_input[i]}) * weights_ch1[i][conv_cycle];
+            mac_out_ch2[i] <= $signed({1'b0, mac_input[i]}) * weights_ch2[i][conv_cycle];
+        end
+    end
+    
+    // Control signals
+    wire mac_enable = (state == COMPUTE) && (x_pos <= 23);
+    wire shift_enable = (state == COMPUTE) && (conv_cycle == 4 || x_pos >= 24);
+    wire conv_done = (conv_cycle == 4) && mac_enable;
+    
+    integer row, col;
+    
     always @(posedge gclk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE;
@@ -117,119 +116,132 @@ module conv1_layer_opt (
             conv_cycle <= 0;
             valid_out <= 0;
             busy <= 0;
+            ready <= 1;  // Initialize to ready
             acc_ch0 <= 0;
             acc_ch1 <= 0;
             acc_ch2 <= 0;
-            line_buf_w_col_idx <= 0;
-            line_buf_w_ptr <= 0;
-            line_buf_r_ptr <= 0;
         end else begin
-            valid_out <= 0; // Default to not valid
-
-            // -- Concurrent Circular Line Buffer Filling --
-            if (valid_in && (state == FILL || state == COMPUTE)) begin
-                line_buffer[line_buf_w_ptr][line_buf_w_col_idx] <= data_in;
-                if (line_buf_w_col_idx == WIDTH - 1) begin
-                    line_buf_w_col_idx <= 0;
-                    line_buf_w_ptr <= (line_buf_w_ptr == KERNEL_SIZE - 1) ? 0 : line_buf_w_ptr + 1;
-                end else begin
-                    line_buf_w_col_idx <= line_buf_w_col_idx + 1;
-                end
+            valid_out <= 0;
+            ready <= 0;  // Default: not ready to accept data
+            
+            // Common line buffer write operation (only when ready)
+            if (valid_in && ready && x_pos < WIDTH) begin
+                line_buffer[p_row_line][x_pos] <= data_in;
             end
-
-            // -- Main FSM --
+            
             case (state)
                 IDLE: begin
+                    ready <= 1;  // Ready to receive data
                     if (valid_in) begin
                         state <= FILL;
                         busy <= 1;
-                        // Reset all pointers and positions for a new image
-                        line_buf_w_col_idx <= 1;
-                        line_buf_w_ptr <= 0;
-                        line_buf_r_ptr <= 0;
-                        x_pos <= 0;
+                        x_pos <= 1;  // Already wrote to position 0
                         y_pos <= 0;
-                        conv_cycle <= 0;
-                        line_buffer[0][0] <= data_in; // Store first pixel
                     end
                 end
-
+                
                 FILL: begin
-                    // Wait until the first KERNEL_SIZE-1 lines are filled.
-                    // The KERNEL_SIZE-th line is being filled concurrently.
-                    if (line_buf_w_ptr == KERNEL_SIZE - 1 && line_buf_w_col_idx == 0) begin
-                        state <= COMPUTE;
-                        // Start computation, conv_cycle 0 will load the initial window
+                    ready <= 1;  // Always ready during FILL
+                    if (valid_in) begin
+                        if (x_pos == WIDTH - 1) begin
+                            x_pos <= 0;
+                            if (y_pos == KERNEL_SIZE - 1) begin
+                                // Transition to COMPUTE
+                                state <= COMPUTE;
+                                y_pos <= KERNEL_SIZE;  // Continue from row 5
+                                conv_cycle <= 0;
+                            end else begin
+                                y_pos <= y_pos + 1;
+                            end
+                        end else begin
+                            x_pos <= x_pos + 1;
+                        end
                     end
                 end
-
+                
                 COMPUTE: begin
-                    case (conv_cycle)
-                        0: begin // Cycle 0: Prepare for computation
-                            // Load/Shift window_buffer based on position
-                            if (x_pos == 0) begin // New row: Full load from line_buffer
-                                for (integer r = 0; r < KERNEL_SIZE; r = r + 1) begin
-                                    for (integer c = 0; c < KERNEL_SIZE; c = c + 1) begin
-                                        window_buffer[r][c] <= line_buffer[r][c];
-                                    end
-                                end
-                            end
-                            // For x_pos > 0, the window is already shifted and loaded in cycle 6.
-                            
-                            // Reset accumulators for the new output pixel
-                            acc_ch0 <= 0;
-                            acc_ch1 <= 0;
-                            acc_ch2 <= 0;
-                            conv_cycle <= 1;
+                    // Ready signal control based on position and MAC state
+                    if (x_pos < WIDTH) begin
+                        // During MAC operation, only ready after conv_done or at x_pos 24-27
+                        ready <= (conv_cycle == 4) || (x_pos >= 24);
+                    end else begin
+                        ready <= 0;  // Not ready when x_pos >= WIDTH
+                    end
+                    
+                    // MAC operation
+                    if (mac_enable) begin
+                        if (conv_cycle == 0) begin
+                            // First cycle - only accumulate current MACs
+                            acc_ch0 <= mac_out_ch0[0] + mac_out_ch0[1] + 
+                                      mac_out_ch0[2] + mac_out_ch0[3] + mac_out_ch0[4];
+                            acc_ch1 <= mac_out_ch1[0] + mac_out_ch1[1] + 
+                                      mac_out_ch1[2] + mac_out_ch1[3] + mac_out_ch1[4];
+                            acc_ch2 <= mac_out_ch2[0] + mac_out_ch2[1] + 
+                                      mac_out_ch2[2] + mac_out_ch2[3] + mac_out_ch2[4];
+                        end else begin
+                            // Accumulate with previous results
+                            acc_ch0 <= acc_ch0 + mac_out_ch0[0] + mac_out_ch0[1] + 
+                                      mac_out_ch0[2] + mac_out_ch0[3] + mac_out_ch0[4];
+                            acc_ch1 <= acc_ch1 + mac_out_ch1[0] + mac_out_ch1[1] + 
+                                      mac_out_ch1[2] + mac_out_ch1[3] + mac_out_ch1[4];
+                            acc_ch2 <= acc_ch2 + mac_out_ch2[0] + mac_out_ch2[1] + 
+                                      mac_out_ch2[2] + mac_out_ch2[3] + mac_out_ch2[4];
                         end
-
-                        1, 2, 3, 4, 5: begin // Cycles 1-5: MAC accumulation
-                            acc_ch0 <= acc_ch0 + mac_out_ch0[0] + mac_out_ch0[1] + mac_out_ch0[2] + mac_out_ch0[3] + mac_out_ch0[4];
-                            acc_ch1 <= acc_ch1 + mac_out_ch1[0] + mac_out_ch1[1] + mac_out_ch1[2] + mac_out_ch1[3] + mac_out_ch1[4];
-                            acc_ch2 <= acc_ch2 + mac_out_ch2[0] + mac_out_ch2[1] + mac_out_ch2[2] + mac_out_ch2[3] + mac_out_ch2[4];
-                            conv_cycle <= conv_cycle + 1;
-                        end
-
-                        6: begin // Cycle 6: Output results and shift for next position
-                            // -- 1. Output Calculation (Overlapped with Shift) --
+                        
+                        if (conv_cycle == 4) begin
+                            // Output with bias (can be done in parallel with shift)
                             conv_out_1 <= acc_ch0[19:8] + {{4{bias[0][7]}}, bias[0]};
                             conv_out_2 <= acc_ch1[19:8] + {{4{bias[1][7]}}, bias[1]};
                             conv_out_3 <= acc_ch2[19:8] + {{4{bias[2][7]}}, bias[2]};
                             valid_out <= 1;
-
-                            // -- 2. Position and Pointer Update --
-                            if (x_pos == OUT_WIDTH - 1) begin // End of a row
-                                x_pos <= 0;
-                                y_pos <= y_pos + 1;
-                                // A new row of the image has been processed, so update the read pointer
-                                line_buf_r_ptr <= (line_buf_r_ptr == KERNEL_SIZE - 1) ? 0 : line_buf_r_ptr + 1;
-
-                                if (y_pos == OUT_HEIGHT - 1) begin // End of image
-                                    state <= IDLE;
-                                    busy <= 0;
-                                end
-                            end else begin // Middle of a row
-                                x_pos <= x_pos + 1;
-                            end
-
-                            // -- 3. Window Buffer Shift (Overlapped with Output) --
-                            // This shift prepares the window for the *next* position (x_pos+1)
-                            // This is a horizontal shift. Vertical shift is implicit by loading on x_pos=0.
-                            for (integer r = 0; r < KERNEL_SIZE; r = r + 1) begin
-                                // Shift existing data left
-                                for (integer c = 0; c < KERNEL_SIZE - 1; c = c + 1) begin
-                                    window_buffer[r][c] <= window_buffer[r][c+1];
-                                end
-                                // Load only the new column from line_buffer
-                                window_buffer[r][KERNEL_SIZE-1] <= line_buffer[r][x_pos + KERNEL_SIZE];
-                            end
-                            
-                            conv_cycle <= 0; // Go to preparation cycle
+                            conv_cycle <= 0;
+                            // Reset accumulators
+                            acc_ch0 <= 0;
+                            acc_ch1 <= 0;
+                            acc_ch2 <= 0;
+                        end else begin
+                            conv_cycle <= conv_cycle + 1;
                         end
-                    endcase
+                    end
+                    
+                    // Window buffer shift - at cycle 4 or at x_pos 24-27
+                    if (shift_enable) begin
+                        // Shift columns left
+                        for (row = 0; row < KERNEL_SIZE; row = row + 1) begin
+                            for (col = 0; col < KERNEL_SIZE - 1; col = col + 1) begin
+                                window_buffer[row][col] <= window_buffer[row][col + 1];
+                            end
+                            // Load new column from line buffer
+                            window_buffer[row][KERNEL_SIZE-1] <= 
+                                line_buffer[row][p_col_line_to_win];
+                        end
+                    end
+                    
+                    // Position update - only when handshake succeeds or at row end
+                    if ((valid_in && ready) || x_pos >= WIDTH) begin
+                        if (x_pos == WIDTH - 1) begin
+                            x_pos <= 0;
+                            if (y_pos == HEIGHT - 1) begin
+                                // Frame complete
+                                state <= IDLE;
+                                busy <= 0;
+                                y_pos <= 0;  // Reset for next frame
+                            end else begin
+                                y_pos <= y_pos + 1;
+                                conv_cycle <= 0;
+                            end
+                        end else begin
+                            x_pos <= x_pos + 1;
+                            // Reset conv_cycle for positions 24-27
+                            if (x_pos == 23) begin
+                                conv_cycle <= 0;
+                            end
+                        end
+                    end
                 end
+                
+                default: state <= IDLE;
             endcase
         end
     end
-
 endmodule
